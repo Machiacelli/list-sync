@@ -22,7 +22,7 @@
         <div class="md:col-span-2">
           <label class="block text-xs font-semibold mb-2 text-foreground">
             Trakt Client ID
-            <span class="text-danger ml-1">*</span>
+            <!-- removed requirement indicator -->
           </label>
           <Input
             v-model="localValue.clientId"

@@ -1,514 +1,65 @@
-"""
-Overseerr API client for the ListSync application.
-"""
-
-import json
-import logging
 import requests
-from typing import Dict, Any, Tuple, Optional
-from urllib.parse import quote
 
-from ..utils.helpers import calculate_title_similarity, custom_input, color_gradient
 
-class OverseerrClient:
-    """Client for interacting with the Overseerr API."""
-    
-    def __init__(self, overseerr_url: str, api_key: str, requester_user_id: str = "1"):
-        """
-        Initialize the Overseerr API client.
-        
-        Args:
-            overseerr_url (str): Overseerr server URL
-            api_key (str): API key
-            requester_user_id (str, optional): Requester user ID. Defaults to "1".
-        """
-        self.overseerr_url = overseerr_url.rstrip('/')
+class OverseerrAPI:
+    def __init__(self, base_url, api_key=None, email=None, password=None):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+
+        self.email = email
+        self.password = password
+
+        # Auto-login om credentials finns (Seer)
+        if self.email and self.password:
+            self._login()
+
+        # fallback för gamla setups (kan tas bort senare)
         self.api_key = api_key
-        self.requester_user_id = requester_user_id
-        self.headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-        self.request_headers = {"X-Api-Key": api_key, "X-Api-User": requester_user_id, "Content-Type": "application/json"}
 
-    def _headers_for_user(self, requester_user_id: Optional[str] = None) -> Dict[str, str]:
-        """
-        Build request headers for a specific Overseerr user without mutating defaults.
-        """
-        user_id = requester_user_id or self.requester_user_id or "1"
-        return {
-            "X-Api-Key": self.api_key,
-            "X-Api-User": str(user_id),
-            "Content-Type": "application/json"
-        }
-    
-    def test_connection(self):
-        """
-        Test the connection to the Overseerr API.
-        
-        Raises:
-            Exception: If the connection test fails
-        """
-        test_url = f"{self.overseerr_url}/api/v1/status"
-        try:
-            response = requests.get(test_url, headers=self.headers)
-            response.raise_for_status()
-            logging.info("Overseerr API connection successful!")
-            return True
-        except Exception as e:
-            logging.error(f"Overseerr API connection failed. Error: {str(e)}")
-            raise
-    
-    def set_requester_user(self) -> str:
-        """
-        Set the requester user based on available users.
-        
-        Returns:
-            str: The requester user ID
-        """
-        users_url = f"{self.overseerr_url}/api/v1/user"
-        try:
-            requester_user_id = "1"
-            response = requests.get(users_url, headers=self.headers)
-            response.raise_for_status()
-            jsonResult = response.json()
-            
-            if jsonResult['pageInfo']['results'] > 1:
-                print(color_gradient("\n📋 Multiple users detected, you can choose which user will make the requests on ListSync behalf.\n", "#00aaff", "#00ffaa"))
-                for result in jsonResult['results']:
-                    print(color_gradient(f"{result['id']}. {result['displayName']}", "#ffaa00", "#ff5500"))
-                requester_user_id = custom_input(color_gradient("\nEnter the number of the user to use as requester: ", "#ffaa00", "#ff5500"))
-                if not next((x for x in jsonResult['results'] if str(x['id']) == requester_user_id), None):
-                    requester_user_id = "1"
-                    print(color_gradient("\n❌  Invalid option, using admin as requester user.", "#ff0000", "#aa0000"))
-                
-            logging.info("Requester user set!")
-            return requester_user_id
-        except Exception as e:
-            logging.error(f"Failed to set requester user. Error: {str(e)}")
-            return "1"  # Default fallback
-    
-    def get_media_by_tmdb_id(self, tmdb_id: int, media_type: str) -> Optional[Dict[str, Any]]:
-        """
-        Get media details directly by TMDB ID (no search needed).
-        
-        Args:
-            tmdb_id (int): TMDB ID
-            media_type (str): Media type (movie or tv)
-            
-        Returns:
-            Optional[Dict[str, Any]]: Media details with ID and status or None if not found
-        """
-        media_url = f"{self.overseerr_url}/api/v1/{media_type}/{tmdb_id}"
-        
-        try:
-            logging.info(f"🎯 Overseerr API: Direct lookup by TMDB ID: {tmdb_id} [{media_type}]")
-            logging.debug(f"Request URL: {media_url}")
-            
-            response = requests.get(media_url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 404:
-                logging.info(f"❌ Overseerr API: TMDB ID {tmdb_id} not found in Overseerr")
-                return None
-            
-            if response.status_code == 403:
-                logging.error(f"❌ Overseerr API: 403 Forbidden - API key does not have permission to access /api/v1/{media_type}/{tmdb_id}")
-                logging.error(f"   Please check your API key permissions in Overseerr settings. The key needs 'Read' permission for media endpoints.")
-                return None
-            
-            response.raise_for_status()
-            media_data = response.json()
-            
-            # Extract the title for logging
-            media_title = media_data.get('title') if media_type == 'movie' else media_data.get('name')
-            media_year = None
-            try:
-                if media_type == 'movie' and 'releaseDate' in media_data:
-                    media_year = media_data['releaseDate'][:4]
-                elif media_type == 'tv' and 'firstAirDate' in media_data:
-                    media_year = media_data['firstAirDate'][:4]
-            except (ValueError, TypeError):
-                pass
-            
-            logging.info(f"✅ Overseerr API: Found '{media_title}' ({media_year}) via TMDB ID {tmdb_id}")
-            # Removed verbose media data logging to reduce log size
-            
-            # Ensure tmdb_id is an integer (may be string from collections)
-            overseerr_id = int(tmdb_id) if tmdb_id else None
-            
-            return {
-                "id": overseerr_id,  # Use TMDB ID as the identifier (converted to int)
+    def _login(self):
+        r = self.session.post(
+            f"{self.base_url}/api/v1/auth/login",
+            json={
+                "email": self.email,
+                "password": self.password
+            }
+        )
+
+        if r.status_code != 200:
+            raise Exception(f"Seer login failed: {r.text}")
+
+    def _request(self, method, endpoint, **kwargs):
+        url = f"{self.base_url}{endpoint}"
+
+        r = self.session.request(method, url, **kwargs)
+
+        # auto re-login om session dör
+        if r.status_code == 401 and self.email and self.password:
+            self._login()
+            r = self.session.request(method, url, **kwargs)
+
+        return r
+
+    def get_status(self):
+        return self._request("GET", "/api/v1/status").json()
+
+    def get_media(self, media_type, media_id):
+        return self._request(
+            "GET",
+            f"/api/v1/{media_type}/{media_id}"
+        ).json()
+
+    def request_media(self, media_type, media_id):
+        r = self._request(
+            "POST",
+            "/api/v1/request",
+            json={
                 "mediaType": media_type,
-                "title": media_title,
-                "year": media_year
+                "mediaId": media_id
             }
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"❌ Overseerr API error for TMDB ID {tmdb_id}: {str(e)}")
-            return None
-    
-    def search_media(self, media_title: str, media_type: str, release_year: int = None) -> Optional[Dict[str, Any]]:
-        """
-        Search for media in Overseerr (fallback method when no TMDB ID available).
-        
-        Args:
-            media_title (str): Title to search for
-            media_type (str): Media type (movie or tv)
-            release_year (int, optional): Release year. Defaults to None.
-            
-        Returns:
-            Optional[Dict[str, Any]]: Search result or None if not found
-        """
-        logging.info(f"🔍 Overseerr API: Fallback search by title: '{media_title}' ({release_year}) [{media_type}]")
-        search_url = f"{self.overseerr_url}/api/v1/search"
-        search_title = media_title  # Use the provided title
-        
-        page = 1
-        best_match = None
-        best_score = 0
-        
-        while True:
-            try:
-                # Use quote to properly encode all special characters including forward slashes
-                # quote() encodes spaces as %20 and slashes as %2F (unlike requests.utils.quote which doesn't encode /)
-                encoded_query = quote(search_title, safe='')
-                url = f"{search_url}?query={encoded_query}&page={page}&language=en"
-                
-                logging.info(f"  📄 Overseerr API: Searching page {page} for '{search_title}' (Year: {release_year})")
-                logging.debug(f"  Request URL: {url}")
-                response = requests.get(url, headers=self.headers, timeout=10)
-                
-                if response.status_code == 429:
-                    logging.warning("Rate limited, waiting 5 seconds...")
-                    import time
-                    time.sleep(5)
-                    continue
-                
-                if response.status_code == 403:
-                    logging.error(f"❌ Overseerr API: 403 Forbidden - API key does not have permission to access /api/v1/search")
-                    logging.error(f"   Please check your API key permissions in Overseerr settings. The key needs 'Read' permission for search endpoints.")
-                    return None
-                    
-                response.raise_for_status()
-                search_results = response.json()
-                
-                if not search_results.get("results"):
-                    break
-                    
-                for result in search_results["results"]:
-                    result_type = result.get("mediaType")
-                    if result_type != media_type:
-                        continue
-                    
-                    # Get the title based on media type
-                    result_title = result.get("title") if media_type == "movie" else result.get("name")
-                    if not result_title:
-                        continue
-                    
-                    # Get year
-                    result_year = None
-                    try:
-                        if media_type == "movie" and "releaseDate" in result:
-                            result_year = int(result["releaseDate"][:4])
-                        elif media_type == "tv" and "firstAirDate" in result:
-                            result_year = int(result["firstAirDate"][:4])
-                    except (ValueError, TypeError):
-                        pass
-                    
-                    # Calculate title similarity
-                    similarity = calculate_title_similarity(search_title, result_title)
-                    
-                    # Calculate final score
-                    score = similarity
-                    
-                    # Year matching
-                    if release_year and result_year:
-                        if release_year == result_year:
-                            score *= 2  # Double score for exact year match
-                            logging.debug(f"  ✓ Exact year match for '{result_title}' ({result_year}) - Base similarity: {similarity}")
-                        elif abs(release_year - result_year) <= 1:
-                            score *= 1.5  # 1.5x score for off-by-one year
-                            logging.debug(f"  ≈ Close year match for '{result_title}' ({result_year}) - Base similarity: {similarity}")
-                    
-                    logging.debug(f"  🔍 Match candidate: '{result_title}' ({result_year}) - Score: {score}")
-                    
-                    # Update best match if we have a better score
-                    # For exact year matches, require a lower similarity threshold
-                    min_similarity = 0.5 if (release_year and result_year and release_year == result_year) else 0.7
-                    
-                    if score > best_score and similarity >= min_similarity:
-                        best_score = score
-                        best_match = result
-                        logging.info(f"  ⭐ New best match: '{result_title}' ({result_year}) - Score: {score}")
-                
-                # Only continue to next page if we haven't found a good match
-                if best_score > 1.5 or page >= search_results.get("totalPages", 1):
-                    break
-                
-                page += 1
-                
-            except requests.exceptions.RequestException as e:
-                logging.error(f'Error searching for "{search_title}": {str(e)}')
-                if "429" in str(e):
-                    import time
-                    time.sleep(5)
-                    continue
-                raise
+        )
 
-        if best_match:
-            result_title = best_match.get("title") if media_type == "movie" else best_match.get("name")
-            result_year = None
-            try:
-                if media_type == "movie" and "releaseDate" in best_match:
-                    result_year = best_match["releaseDate"][:4]
-                elif media_type == "tv" and "firstAirDate" in best_match:
-                    result_year = best_match["firstAirDate"][:4]
-            except (ValueError, TypeError):
-                pass
-            
-            logging.info(f"✅ Overseerr API: Final match for '{media_title}' ({release_year}): '{result_title}' ({result_year}) - Score: {best_score}")
-            return {
-                "id": best_match["id"],
-                "mediaType": best_match["mediaType"],
-            }
-        
-        logging.warning(f'❌ Overseerr API: No matching results found for "{media_title}" ({release_year}) of type "{media_type}"')
-        return None
-    
-    def get_media_status(self, media_id: int, media_type: str) -> Tuple[bool, bool, int]:
-        """
-        Get the status of media in Overseerr.
-        
-        Args:
-            media_id (int): Media ID (must be integer, not string)
-            media_type (str): Media type (movie or tv)
-            
-        Returns:
-            Tuple[bool, bool, int]: Availability, requested status, and number of seasons
-        """
-        # Ensure media_id is an integer (may be string from API responses)
-        try:
-            media_id = int(media_id)
-        except (ValueError, TypeError):
-            logging.error(f"Invalid media_id type in get_media_status: {type(media_id)} = {media_id}")
-            raise ValueError(f"media_id must be an integer, got {type(media_id)}: {media_id}")
-        
-        media_url = f"{self.overseerr_url}/api/v1/{media_type}/{media_id}"
-        
-        try:
-            response = requests.get(media_url, headers=self.headers)
-            response.raise_for_status()
-            media_data = response.json()
-            # Log only essential info instead of full response to reduce log size
-            status = media_data.get("mediaInfo", {}).get("status")
-            logging.debug(f"Overseerr {media_type} ID {media_id}: status={status}")
+        if r.status_code not in [200, 201]:
+            raise Exception(f"Request failed: {r.text}")
 
-            media_info = media_data.get("mediaInfo", {})
-            status = media_info.get("status") if media_info else None
-            number_of_seasons = self.extract_number_of_seasons(media_data)
-
-            # Handle None status (no mediaInfo - movie not in Overseerr yet)
-            if status is None:
-                logging.debug(f"Status for {media_type} ID {media_id}: None (not in Overseerr database - available to request)")
-                # Not available, not requested - should trigger a request
-                return False, False, number_of_seasons
-
-            logging.debug(f"Status for {media_type} ID {media_id}: {status}")
-            logging.debug(f"Number of seasons for {media_type} ID {media_id}: {number_of_seasons}")
-
-            # Status codes:
-            # 0: NOT REQUESTED (available to request)
-            # 1: REQUESTED (pending approval)
-            # 2: PENDING (approved, waiting for download)
-            # 3: PROCESSING (downloading/importing)
-            # 4: PARTIALLY_AVAILABLE (some content available)
-            # 5: AVAILABLE (fully available)
-            
-            # Status 0 means not requested yet - should trigger a request
-            if status == 0:
-                logging.debug(f"Status 0 for {media_type} ID {media_id}: Not requested yet (available to request)")
-                return False, False, number_of_seasons
-            
-            is_available_to_watch = status in [4, 5]
-            is_requested = status in [1, 2, 3]
-
-            return is_available_to_watch, is_requested, number_of_seasons
-        except Exception as e:
-            logging.error(f"Error confirming status for {media_type} ID {media_id}: {str(e)}")
-            raise
-    
-    def extract_number_of_seasons(self, media_data):
-        """
-        Extract the number of seasons from media data.
-        
-        Args:
-            media_data (dict): Media data from Overseerr
-            
-        Returns:
-            int: Number of seasons (defaults to 1)
-        """
-        number_of_seasons = media_data.get("numberOfSeasons")
-        logging.debug(f"Extracted number of seasons: {number_of_seasons}")
-        return number_of_seasons if number_of_seasons is not None else 1
-    
-    def request_media(self, media_id: int, media_type: str, is_4k: bool = False, requester_user_id: Optional[str] = None) -> str:
-        """
-        Request media in Overseerr.
-        
-        Args:
-            media_id (int): Media ID (must be integer, not string)
-            media_type (str): Media type (movie or tv)
-            is_4k (bool, optional): Whether to request 4K. Defaults to False.
-            
-        Returns:
-            str: Status of the request ("success", "already_requested", or "error")
-        """
-        # Ensure media_id is an integer (may be string from API responses)
-        try:
-            media_id = int(media_id)
-        except (ValueError, TypeError):
-            logging.error(f"Invalid media_id type: {type(media_id)} = {media_id}")
-            return "error"
-        
-        request_url = f"{self.overseerr_url}/api/v1/request"
-        payload = {
-            "mediaId": media_id,  # Ensure it's an integer, not string
-            "mediaType": media_type,
-            "is4k": is_4k
-        }
-        
-        try:
-            response = requests.post(request_url, headers=self._headers_for_user(requester_user_id), json=payload)
-            response.raise_for_status()
-            # Log only success/error instead of full response to reduce log size
-            logging.debug(f"Request successful for {media_type} ID {media_id}")
-            return "success"
-        except requests.exceptions.HTTPError as e:
-            # Handle 400 Bad Request - might mean already requested
-            if e.response.status_code == 400:
-                try:
-                    error_data = e.response.json()
-                    error_message = error_data.get("message", "").lower()
-                    # Check if error indicates already requested
-                    if any(phrase in error_message for phrase in ["already", "duplicate", "exists", "requested"]):
-                        logging.info(f"Media {media_type} ID {media_id} already requested (400 response)")
-                        return "already_requested"
-                except:
-                    pass
-                logging.error(f"Bad request (400) for {media_type} ID {media_id}: {e.response.text}")
-            else:
-                logging.error(f"HTTP error requesting {media_type} ID {media_id}: {e.response.status_code} - {e.response.text}")
-            return "error"
-        except Exception as e:
-            logging.error(f"Error requesting {media_type} ID {media_id}: {str(e)}")
-            return "error"
-    
-    def request_tv_series(self, tv_id: int, number_of_seasons: int, is_4k: bool = False, requester_user_id: Optional[str] = None) -> str:
-        """
-        Request TV series in Overseerr with specific seasons.
-        
-        Args:
-            tv_id (int): TV series ID (must be integer, not string)
-            number_of_seasons (int): Number of seasons to request
-            is_4k (bool, optional): Whether to request 4K. Defaults to False.
-            
-        Returns:
-            str: Status of the request ("success" or "error")
-        """
-        # Ensure tv_id is an integer (may be string from API responses)
-        try:
-            tv_id = int(tv_id)
-        except (ValueError, TypeError):
-            logging.error(f"Invalid tv_id type: {type(tv_id)} = {tv_id}")
-            return "error"
-        
-        request_url = f"{self.overseerr_url}/api/v1/request"
-        
-        seasons_list = [i for i in range(1, number_of_seasons + 1)]
-        logging.debug(f"Seasons list for TV series ID {tv_id}: {seasons_list}")
-        
-        payload = {
-            "mediaId": tv_id,  # Ensure it's an integer, not string
-            "mediaType": "tv",
-            "is4k": is_4k,
-            "seasons": seasons_list
-        }
-        
-        logging.debug(f"Requesting TV series ID {tv_id}: {number_of_seasons} seasons")
-
-        try:
-            response = requests.post(request_url, headers=self._headers_for_user(requester_user_id), json=payload)
-            response.raise_for_status()
-            logging.debug(f"TV series request successful for ID {tv_id}")
-            return "success"
-        except requests.exceptions.HTTPError as e:
-            # Handle 400 Bad Request - might mean already requested
-            if e.response.status_code == 400:
-                try:
-                    error_data = e.response.json()
-                    error_message = error_data.get("message", "").lower()
-                    # Check if error indicates already requested
-                    if any(phrase in error_message for phrase in ["already", "duplicate", "exists", "requested"]):
-                        logging.info(f"TV series ID {tv_id} already requested (400 response)")
-                        return "already_requested"
-                except:
-                    pass
-                logging.error(f"Bad request (400) for TV series ID {tv_id}: {e.response.text}")
-            else:
-                logging.error(f"HTTP error requesting TV series ID {tv_id}: {e.response.status_code} - {e.response.text}")
-            return "error"
-        except Exception as e:
-            logging.error(f"Error requesting TV series ID {tv_id}: {str(e)}")
-            return "error"
-    
-    def request_specific_season(self, tv_id: int, season_number: int, is_4k: bool = False, requester_user_id: Optional[str] = None) -> str:
-        """
-        Request a specific season of a TV series in Overseerr.
-        
-        Args:
-            tv_id (int): TV series TMDB ID (must be integer, not string)
-            season_number (int): Season number to request
-            is_4k (bool, optional): Whether to request 4K. Defaults to False.
-            
-        Returns:
-            str: Status of the request ("success" or "error")
-        """
-        # Ensure tv_id is an integer (may be string from API responses)
-        try:
-            tv_id = int(tv_id)
-        except (ValueError, TypeError):
-            logging.error(f"Invalid tv_id type: {type(tv_id)} = {tv_id}")
-            return "error"
-        
-        request_url = f"{self.overseerr_url}/api/v1/request"
-        
-        payload = {
-            "mediaId": tv_id,  # Ensure it's an integer, not string
-            "mediaType": "tv",
-            "is4k": is_4k,
-            "seasons": [season_number]  # Request only the specific season
-        }
-        
-        logging.info(f"📺 Requesting Season {season_number} for TV series TMDB ID {tv_id}")
-
-        try:
-            response = requests.post(request_url, headers=self._headers_for_user(requester_user_id), json=payload)
-            response.raise_for_status()
-            logging.info(f"✅ Successfully requested Season {season_number} for TV series ID {tv_id}")
-            return "success"
-        except requests.exceptions.HTTPError as e:
-            # Handle 400 Bad Request - might mean already requested
-            if e.response.status_code == 400:
-                try:
-                    error_data = e.response.json()
-                    error_message = error_data.get("message", "").lower()
-                    # Check if error indicates already requested
-                    if any(phrase in error_message for phrase in ["already", "duplicate", "exists", "requested"]):
-                        logging.info(f"Season {season_number} for TV series ID {tv_id} already requested (400 response)")
-                        return "already_requested"
-                except:
-                    pass
-                logging.error(f"Bad request (400) for Season {season_number} TV series ID {tv_id}: {e.response.text}")
-            else:
-                logging.error(f"HTTP error requesting Season {season_number} for TV series ID {tv_id}: {e.response.status_code} - {e.response.text}")
-            return "error"
-        except Exception as e:
-            logging.error(f"❌ Error requesting Season {season_number} for TV series ID {tv_id}: {str(e)}")
-            return "error"
+        return r.json()
